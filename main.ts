@@ -7,8 +7,10 @@
 // Environment variables:
 //   BEEHIIV_API_KEY            required, secret
 //   BEEHIIV_PUBLICATION_ID     required
-//   BEEHIIV_AUTOMATION_ID      optional
-//   REQUIRE_MARKETING_CONSENT  optional, "true" or "false" (default: "true")
+//   BEEHIIV_SHOPIFY_AUTOMATION_ID  optional
+//   BEEHIIV_DIGITAL_AUTOMATION_ID  optional
+//   BEEHIIV_PRINT_AUTOMATION_ID    optional
+//   REQUIRE_MARKETING_CONSENT      optional, "true" or "false" (default: "true")
 
 const BEEHIIV_API = "https://api.beehiiv.com/v2";
 
@@ -80,6 +82,12 @@ Deno.serve(async (request: Request) => {
 
     const customFields = buildCustomFields(payload);
 
+    const automationIds =
+      getAutomationIds(
+        env,
+        payload,
+      );
+
     // Look up subscriber first
     const existingSubscriber =
       await getBeehiivSubscriber(env, email);
@@ -123,6 +131,7 @@ Deno.serve(async (request: Request) => {
         env,
         email,
         customFields,
+        automationIds,
       );
 
       return jsonResponse({
@@ -146,55 +155,65 @@ Deno.serve(async (request: Request) => {
       customFields,
     );
 
-    let automationResult: any = {
-      triggered: false,
-      reason: "automation_not_configured",
-    };
+    const automationResults: any[] = [];
 
-    if (env.automationId) {
-      const status =
-        clean(existingSubscriber.status).toLowerCase();
+    const status =
+      clean(
+        existingSubscriber.status,
+      ).toLowerCase();
 
-      // Do not use a purchase event to silently reactivate an
-      // unsubscribed beehiiv subscriber.
-      if (
-        status === "" ||
-        status === "active" ||
-        status === "validating"
+    if (
+      status === "" ||
+      status === "active" ||
+      status === "validating"
+    ) {
+      for (
+        const automationId
+        of automationIds
       ) {
         try {
           const journey =
             await triggerBeehiivAutomation(
               env,
               email,
+              automationId,
             );
 
-          automationResult = {
-            triggered: true,
+          automationResults.push({
+            automation_id:
+              automationId,
+            triggered:
+              true,
             journey_id:
               journey?.data?.id ?? null,
-          };
+          });
         } catch (error) {
           console.error(
-            "beehiiv automation error:",
+            `beehiiv automation ${automationId} error:`,
             error,
           );
 
-          automationResult = {
-            triggered: false,
-            reason: "automation_failed",
+          automationResults.push({
+            automation_id:
+              automationId,
+            triggered:
+              false,
             error:
               error instanceof Error
                 ? error.message
                 : String(error),
-          };
+          });
         }
-      } else {
-        automationResult = {
-          triggered: false,
-          reason: `subscriber_status_${status}`,
-        };
       }
+    } else if (
+      automationIds.length
+    ) {
+      automationResults.push({
+        triggered:
+          false,
+        reason:
+          `subscriber_status_${status}`,
+      });
     }
 
     return jsonResponse({
@@ -205,8 +224,8 @@ Deno.serve(async (request: Request) => {
         updated?.data?.id ??
         existingSubscriber?.id ??
         null,
-      automation:
-        automationResult,
+      automations:
+        automationResults,
       warnings:
         updated?.warnings ?? [],
     });
@@ -246,13 +265,26 @@ function getEnv() {
   const publicationId =
     Deno.env.get("BEEHIIV_PUBLICATION_ID") || "";
 
-  const automationId =
-    Deno.env.get("BEEHIIV_AUTOMATION_ID") || "";
+  const shopifyAutomationId =
+    Deno.env.get(
+      "BEEHIIV_SHOPIFY_AUTOMATION_ID"
+    ) || "";
+
+  const digitalAutomationId =
+    Deno.env.get(
+      "BEEHIIV_DIGITAL_AUTOMATION_ID"
+    ) || "";
+
+  const printAutomationId =
+    Deno.env.get(
+      "BEEHIIV_PRINT_AUTOMATION_ID"
+    ) || "";
 
   const requireMarketingConsent =
     (
-      Deno.env.get("REQUIRE_MARKETING_CONSENT") ??
-      "true"
+      Deno.env.get(
+        "REQUIRE_MARKETING_CONSENT"
+      ) ?? "true"
     ).toLowerCase() !== "false";
 
   if (!apiKey) {
@@ -270,10 +302,52 @@ function getEnv() {
   return {
     apiKey,
     publicationId,
-    automationId,
+    shopifyAutomationId,
+    digitalAutomationId,
+    printAutomationId,
     requireMarketingConsent,
   };
 }
+
+/* ============================================================
+   SELECT BEEHIIV AUTOMATIONS
+============================================================ */
+
+function getAutomationIds(
+  env: ReturnType<typeof getEnv>,
+  payload: any,
+) {
+  const automationIds: string[] = [];
+
+  if (env.shopifyAutomationId) {
+    automationIds.push(
+      env.shopifyAutomationId,
+    );
+  }
+
+  if (
+    payload.has_digital_subscription === true &&
+    env.digitalAutomationId
+  ) {
+    automationIds.push(
+      env.digitalAutomationId,
+    );
+  }
+
+  if (
+    payload.has_print_subscription === true &&
+    env.printAutomationId
+  ) {
+    automationIds.push(
+      env.printAutomationId,
+    );
+  }
+
+  return [
+    ...new Set(automationIds),
+  ];
+}
+
 
 
 /* ============================================================
@@ -740,6 +814,7 @@ async function createBeehiivSubscriber(
   env: ReturnType<typeof getEnv>,
   email: string,
   customFields: any[],
+  automationIds: string[],
 ) {
   const body: any = {
     email,
@@ -753,11 +828,9 @@ async function createBeehiivSubscriber(
       customFields,
   };
 
-  // beehiiv supports automation_ids when creating a new subscriber.
-  if (env.automationId) {
-    body.automation_ids = [
-      env.automationId,
-    ];
+  if (automationIds.length) {
+    body.automation_ids =
+      automationIds;
   }
 
   return beehiivRequest(
@@ -805,11 +878,12 @@ async function updateBeehiivSubscriber(
 async function triggerBeehiivAutomation(
   env: ReturnType<typeof getEnv>,
   email: string,
+  automationId: string,
 ) {
   return beehiivRequest(
     env,
     `/publications/${env.publicationId}` +
-    `/automations/${env.automationId}/journeys`,
+    `/automations/${automationId}/journeys`,
     {
       method: "POST",
       body:
